@@ -2,7 +2,13 @@
 
 > Single-repo blueprint for a Telegram trading app that accepts **manual** and **automated** signals, **encrypts** them, routes orders to **Merkel Trade**, and records lifecycle events on **Aptos**. Move contracts handle registries and eventing; a signer service (stub now, **TEE later**) performs decryption + policy checks + execution.
 
-Goal: Deliver a modular, privacy-preserving trading flow that’s production-ready for a future TEE migration without changing producer or bot contracts, while maintaining an auditable on-chain trail.
+## Identified Problem (Onboarding Friction)
+
+A large share of retail and institutional traders want autonomous leveraged trading, but onboarding stalls for two reasons: (1) secure wallet automation for decentralized execution is hard—users don’t trust bots that can sign on their behalf; and (2) signal quality is inconsistent or opaque, so traders hesitate to connect real capital.
+
+## Proposed Solution — Aptos AutoTrader
+
+> Aptos Autopilot is an AI-driven trading kit that runs on Aptos L1 and pairs advanced ML signals with secure transaction automation. Signals are encrypted end-to-end, stored on-chain, and executed by a signer service that is stubbed today and upgradeable to a TEE (Trusted Execution Environment) tomorrow. The system integrates natively with the Aptos TypeScript SDK and routes trades through the Merkle Trade SDK for seamless, decentralized leveraged execution.
 ---
 
 ## TL;DR
@@ -24,37 +30,6 @@ Goal: Deliver a modular, privacy-preserving trading flow that’s production-rea
 4. Upgrade path to **TEE** signing without changing upstream producers.
 
 ---
-
-## High-Level Architecture
-
-```mermaid
-flowchart LR
-  subgraph TG[Telegram]
-    U[User] -->|/start /signal /portfolio /leverage| BOT
-  end
-
-  subgraph OffChain
-    BOT[Bot Service] --> ENC[Encrypt Signal (AES-GCM)]
-    ING[Signal Ingestor] --> ENC
-    ENC -->|post_signal(...)| SV_API[SignalVault API Client]
-    WAT[Watcher] --> BOT
-    SIGN[Signer Stub / TEE later] --> VENUE[Merkel Trade Adapter]
-    VENUE --> WAT
-  end
-
-  subgraph Aptos[On-chain (Aptos)]
-    AR[AgentRegistry]
-    ER[EventRegistry]
-    SV[SignalVault]
-  end
-
-  SV_API --> SV
-  SIGN <-->|read SignalPosted| ER
-  SIGN -->|OrderRouted/TradeExecuted events| ER
-  BOT --> AR
-  WAT <-->|listen events| ER
-  BOT --> AR
-```
 
 **Core flows**
 
@@ -201,3 +176,4 @@ aptos-teletrade/
 * [ ] Build signer (decrypt→policy→adapter) with dry-run; then enable live routing.
 * [ ] Build watcher + `/portfolio` view.
 * [ ] Add basic CI (lint, Move tests, TS tests) and E2E smoke.
+
