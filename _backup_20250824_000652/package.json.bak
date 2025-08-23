@@ -1,0 +1,9 @@
+{
+  "name": "aptos-autotrade-bot",
+  "private": true,
+  "workspaces": ["apps/*", "services/*", "libs/*"],
+  "scripts": {
+    "dev": "echo 'start services later'",
+    "build": "echo 'build later'"
+  }
+}

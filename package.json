@@ -1,9 +1,17 @@
 {
-  "name": "aptos-autotrade-bot",
+  "name": "teletrade-bot-min",
+  "version": "1.0.0",
   "private": true,
-  "workspaces": ["apps/*", "services/*", "libs/*"],
+  "type": "module",
   "scripts": {
-    "dev": "echo 'start services later'",
-    "build": "echo 'build later'"
+    "start": "node bot.mjs"
+  },
+  "dependencies": {
+    "@aptos-labs/ts-sdk": "^4.0.0",
+    "@merkletrade/ts-sdk": "",
+    "dotenv": "^16.4.5",
+    "js-sha3": "^0.9.3",
+    "telegraf": "^4.16.3",
+    "undici": "^6.19.8"
   }
 }
