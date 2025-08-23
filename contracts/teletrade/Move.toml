@@ -1,0 +1,12 @@
+[package]
+name = "teletrade"
+version = "0.0.1"
+upgrade_policy = "immutable"
+
+[addresses]
+# This placeholder is resolved at publish time:
+teletrade = "_"
+aptos_framework = "0x1"
+
+[dependencies]
+AptosFramework = { git = "https://github.com/aptos-labs/aptos-core.git", subdir = "aptos-move/framework/aptos-framework", rev = "mainnet" }
