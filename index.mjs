@@ -12,38 +12,34 @@ import {
   PrivateKey,
 } from '@aptos-labs/ts-sdk';
 
-/* ===================== ENV VALIDATION ===================== */
-
+/* ========== ENV ========== */
 const {
   BOT_TOKEN,
   APTOS_NETWORK = 'testnet',
   APTOS_FULLNODE_URL,
   APTOS_NODE_URL,
   APTOS_FAUCET_URL = 'https://faucet.testnet.aptoslabs.com',
-  ADMIN_PRIVATE_KEY = 'ed25519-priv-0x' + Buffer.alloc(32, 1).toString('hex'),
+  // Admin key must be stable; this drives the on-chain agent & admin record
+  ADMIN_PRIVATE_KEY,
+  // Your published package/module address
+  MODULE_ADDR = '0xc15ccf35138f0f6ca4c498d3c17f80e3497bd9b150b0c126f02b326eb05b7255',
+  // Paper engine defaults
   PAPER_START_USDC = '10000',
   DEFAULT_RISK = '5',
+  // Signals
   SIGNAL_FEED_URL = 'http://34.67.134.209:5000/today',
   SIGNAL_POLL_MS = '60000',
+  // Encryption seed for signal blob (optional; will derive from admin key if missing)
   SIGNAL_KEY_HEX,
-  MODULE_ADDR,
 } = process.env;
 
-if (!BOT_TOKEN) {
-  console.error('Missing BOT_TOKEN in .env');
-  process.exit(1);
-}
-if (!MODULE_ADDR) {
-  console.warn('MODULE_ADDR not set; on-chain signal posting will be disabled');
-}
-if (!SIGNAL_KEY_HEX) {
-  console.warn('SIGNAL_KEY_HEX not set; deriving from ADMIN_PRIVATE_KEY');
-}
+if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN in .env');
+if (!ADMIN_PRIVATE_KEY) throw new Error('Missing ADMIN_PRIVATE_KEY in .env');
+if (!MODULE_ADDR) throw new Error('Missing MODULE_ADDR in .env');
 
-/* ===================== APTOS CLIENT ===================== */
-
+/* ========== Aptos client & keys ========== */
 const nodeUrl = APTOS_FULLNODE_URL || APTOS_NODE_URL;
-const net = APTOS_NETWORK.toLowerCase(); // Moved net definition here
+const net = APTOS_NETWORK.toLowerCase();
 const aptosConfig =
   net === 'mainnet'
     ? new AptosConfig({ network: Network.MAINNET })
@@ -53,7 +49,7 @@ const aptosConfig =
 
 const aptos = new Aptos(aptosConfig);
 
-// Key normalization (AIP-80)
+// Normalize to AIP-80 and build admin account
 function normEd25519Key(str) {
   let s = (str || '').trim();
   try { s = PrivateKey.formatPrivateKey(s, 'ed25519'); } catch {}
@@ -61,47 +57,62 @@ function normEd25519Key(str) {
   if (!s.startsWith('0x')) s = '0x' + s;
   return s;
 }
+const ADMIN_KEY_NORM = normEd25519Key(ADMIN_PRIVATE_KEY);
+const adminPriv = new Ed25519PrivateKey(ADMIN_KEY_NORM);
+const admin = Account.fromPrivateKey({ privateKey: adminPriv });
+const ADMIN_ADDR = admin.accountAddress.toString();
 
-let admin;
-try {
-  admin = Account.fromPrivateKey({
-    privateKey: new Ed25519PrivateKey(normEd25519Key(ADMIN_PRIVATE_KEY)),
-  });
-} catch (e) {
-  console.error('Invalid ADMIN_PRIVATE_KEY:', e.message);
-  process.exit(1);
-}
-
-/* ===================== STORAGE ===================== */
-
+/* ========== Storage ========== */
 const USERS_PATH = './users.json';
 const STATE_PATH = './state.json';
 
 async function loadJson(path, fallback) {
-  try {
-    return JSON.parse(await fs.readFile(path, 'utf8'));
-  } catch {
-    return fallback;
-  }
+  try { return JSON.parse(await fs.readFile(path, 'utf8')); }
+  catch { return fallback; }
 }
-
 async function saveJson(path, obj) {
-  try {
-    await fs.writeFile(path, JSON.stringify(obj, null, 2));
-  } catch (e) {
-    console.error(`Failed to save ${path}:`, e.message);
-  }
+  await fs.writeFile(path, JSON.stringify(obj, null, 2));
 }
 
-let users = await loadJson(USERS_PATH, {});
-let state = await loadJson(STATE_PATH, { lastFeedKey: null });
+let users = await loadJson(USERS_PATH, {});   // tid -> { addr, pk, auto, monitor, risk, paperUSDC, positions, alloc, isAdmin }
+let state = await loadJson(STATE_PATH, { admin_tg_id: null, lastFeedKey: null });
 
-/* ===================== HELPERS ===================== */
-
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+/* ========== Helpers ========== */
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
 const to0x = (h) => (h?.startsWith('0x') ? h : `0x${h}`);
+function esc(s) { return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
 
-async function faucetFund(address, amount = 5_000_000) {
+function newRandomEd25519() {
+  try { return Ed25519PrivateKey.generate(); }
+  catch { return new Ed25519PrivateKey(crypto.randomBytes(32)); }
+}
+
+function deriveSignalKey32() {
+  if (SIGNAL_KEY_HEX && /^[0-9a-fA-Fx]{64,66}$/.test(SIGNAL_KEY_HEX)) {
+    return Buffer.from(SIGNAL_KEY_HEX.replace(/^0x/, ''), 'hex');
+  }
+  const adminRaw = Buffer.from(ADMIN_KEY_NORM.replace(/^0x/, ''), 'hex');
+  return crypto.createHash('sha256').update(adminRaw).digest();
+}
+const SIG_KEY32 = deriveSignalKey32();
+
+function aeadEncryptAESGCM(key32, plaintextBuf, aadStr = 'teletrade') {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key32, iv);
+  cipher.setAAD(Buffer.from(aadStr));
+  const ciphertext = Buffer.concat([cipher.update(plaintextBuf), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return { iv, aad: Buffer.from(aadStr), ciphertext, tag };
+}
+function sha256Hex(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+/* ========== Faucet with cooldown ========== */
+const faucetRateLimit = new Map(); // tid -> last_ts
+const FAUCET_COOLDOWN_MS = 45 * 60 * 1000;
+
+async function faucetFund(address, amount = 5_000_000) { // 0.05 APT
   try {
     const res = await fetch(`${APTOS_FAUCET_URL}/mint`, {
       method: 'POST',
@@ -111,12 +122,23 @@ async function faucetFund(address, amount = 5_000_000) {
     if (res.ok) return true;
     const alt = await fetch(`${APTOS_FAUCET_URL}/mint?address=${address}&amount=${amount}`, { method: 'POST' });
     return alt.ok;
-  } catch (e) {
-    console.error(`Faucet fund failed for ${address}:`, e.message);
+  } catch {
     return false;
   }
 }
+async function ensureFaucet(tid, address, tries = 3) {
+  const last = faucetRateLimit.get(tid) || 0;
+  if (Date.now() - last < FAUCET_COOLDOWN_MS) return false;
+  let ok = false;
+  for (let i = 0; i < tries && !ok; i++) {
+    ok = await faucetFund(address);
+    if (!ok) await wait(1500);
+  }
+  if (ok) faucetRateLimit.set(tid, Date.now());
+  return ok;
+}
 
+/* ========== On-chain reads ========== */
 async function getAptBalance(address) {
   try {
     const res = await aptos.getAccountResource({
@@ -125,46 +147,127 @@ async function getAptBalance(address) {
     });
     const v = BigInt(res?.data?.coin?.value ?? '0');
     return Number(v) / 1e8;
-  } catch {
-    return 0;
-  }
+  } catch { return 0; }
 }
-
-function esc(s) {
-  return String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-}
-
-function newRandomEd25519() {
+async function hasAgentResource(addr) {
   try {
-    return Ed25519PrivateKey.generate();
-  } catch {
-    return new Ed25519PrivateKey(crypto.randomBytes(32));
-  }
+    await aptos.getAccountResource({
+      accountAddress: addr,
+      resourceType: `${MODULE_ADDR}::agent_registry::Agent`,
+    });
+    return true;
+  } catch { return false; }
+}
+async function getUserConfig(addr) {
+  try {
+    const res = await aptos.getAccountResource({
+      accountAddress: addr,
+      resourceType: `${MODULE_ADDR}::agent_registry::UserConfig`,
+    });
+    const agent = `0x${res.data.agent.inner}`;
+    const leverage = Number(res.data.leverage);
+    const mode = Number(res.data.mode);
+    return { agent, leverage, mode };
+  } catch { return null; }
 }
 
-/* ===================== USER SHAPE / MIGRATION ===================== */
+/* ========== On-chain writes (tx helpers) ========== */
+async function tx(account, payload) {
+  const built = await aptos.transaction.build.simple({ sender: account.accountAddress, data: payload });
+  const sub = await aptos.signAndSubmitTransaction({ signer: account, transaction: built });
+  await aptos.waitForTransaction({ transactionHash: sub.hash });
+  return sub.hash;
+}
+async function registerAgentIfNeeded(maxLev = 10, metadataHex = '0x') {
+  if (await hasAgentResource(ADMIN_ADDR)) return { already: true };
+  const pubBytes = adminPriv.publicKey().toUint8Array();
+  const payload = {
+    function: `${MODULE_ADDR}::agent_registry::register_agent`,
+    typeArguments: [],
+    functionArguments: [
+      `0x${Buffer.from(pubBytes).toString('hex')}`, // pubkey bytes
+      BigInt(maxLev),
+      metadataHex, // vector<u8>, ok to be 0x
+    ],
+  };
+  const hash = await tx(admin, payload);
+  return { already: false, hash };
+}
+async function linkUserIfNeeded(userAcc) {
+  const addr = userAcc.accountAddress.toString();
+  const cfg = await getUserConfig(addr);
+  if (cfg && cfg.agent.toLowerCase() === ADMIN_ADDR.toLowerCase()) return { already: true };
+  const payload = {
+    function: `${MODULE_ADDR}::agent_registry::link_user`,
+    typeArguments: [],
+    functionArguments: [ADMIN_ADDR],
+  };
+  const hash = await tx(userAcc, payload);
+  return { already: false, hash };
+}
+async function postSignal_user(userAcc, agentAddr, plainObj) {
+  const body = Buffer.from(JSON.stringify(plainObj));
+  const enc = aeadEncryptAESGCM(SIG_KEY32, body, 'teletrade');
+  const h = sha256Hex(body).slice(0, 64); // 32 bytes hex
+  const payload = {
+    function: `${MODULE_ADDR}::signal_vault::post_signal`,
+    typeArguments: [],
+    functionArguments: [
+      agentAddr,
+      `0x${h}`,               // hash_for_store
+      `0x${h}`,               // hash_for_event
+      `0x${enc.ciphertext.toString('hex')}`,
+      `0x${enc.iv.toString('hex')}`,
+      `0x${enc.aad.toString('hex')}`,
+      `0x${enc.tag.toString('hex')}`,
+      BigInt(Math.floor(Date.now() / 1000)),
+    ],
+  };
+  const hash = await tx(userAcc, payload);
+  return hash;
+}
 
+/* ========== Users ========== */
 function sanitizeUser(u) {
   if (!u || typeof u !== 'object') return null;
   if (typeof u.addr !== 'string' || !u.addr.startsWith('0x')) return null;
   if (typeof u.pk !== 'string') return null;
   u.auto = Boolean(u.auto);
   u.monitor = Boolean(u.monitor);
+  u.isAdmin = Boolean(u.isAdmin);
   u.risk = Number.isFinite(Number(u.risk)) ? Math.max(1, Math.min(100, Number(u.risk))) : Number(DEFAULT_RISK);
   u.paperUSDC = Number.isFinite(Number(u.paperUSDC)) ? Math.max(0, Number(u.paperUSDC)) : Number(PAPER_START_USDC);
   u.positions = Array.isArray(u.positions) ? u.positions : [];
   u.alloc = Number.isFinite(Number(u.alloc)) && u.alloc > 0 && u.alloc <= 1 ? Number(u.alloc) : null;
   return u;
 }
-
 function ensureUser(tid) {
   let u = users[tid];
+  // If this telegram id is the designated admin, we bind the env admin wallet
+  if (state.admin_tg_id && tid === String(state.admin_tg_id)) {
+    u = {
+      ...(u || {}),
+      addr: ADMIN_ADDR,
+      pk: ADMIN_KEY_NORM,        // keep admin key attached (stable)
+      isAdmin: true,
+      auto: true,
+      monitor: true,
+      risk: Number(DEFAULT_RISK),
+      paperUSDC: Number(PAPER_START_USDC),
+      positions: (u && Array.isArray(u.positions)) ? u.positions : [],
+      alloc: u?.alloc ?? null,
+    };
+    users[tid] = sanitizeUser(u);
+    return users[tid];
+  }
+
   if (!u) {
     const pk = newRandomEd25519();
     const acc = Account.fromPrivateKey({ privateKey: pk });
     u = users[tid] = {
       addr: acc.accountAddress.toString(),
       pk: pk.toString(),
+      isAdmin: false,
       auto: true,
       monitor: false,
       risk: Number(DEFAULT_RISK),
@@ -178,12 +281,16 @@ function ensureUser(tid) {
       delete users[tid];
       return ensureUser(tid);
     }
+    // protect: never overwrite admin wallet by accident
+    if (u.isAdmin) {
+      u.addr = ADMIN_ADDR;
+      u.pk = ADMIN_KEY_NORM;
+    }
     users[tid] = u;
   }
   return u;
 }
-
-// Sanitize all users at startup
+// sanitize all
 for (const k of Object.keys(users)) {
   const fixed = sanitizeUser(users[k]);
   if (fixed) users[k] = fixed;
@@ -191,15 +298,13 @@ for (const k of Object.keys(users)) {
 }
 await saveJson(USERS_PATH, users);
 
-/* ===================== PAPER ENGINE ===================== */
-
+/* ========== Paper engine ========== */
 function latestPriceBySymbol(feedJson, symbol) {
   const arr = feedJson?.forecast_today_hourly?.[symbol];
   if (!Array.isArray(arr) || !arr.length) return null;
   const last = arr[arr.length - 1];
   return Number(last.entry_price) || null;
 }
-
 function closePosition(u, position, closePrice) {
   const notional = position.collateral * position.leverage;
   const change = (closePrice - position.entry) / position.entry;
@@ -207,56 +312,31 @@ function closePosition(u, position, closePrice) {
   u.paperUSDC = Math.max(0, u.paperUSDC + position.collateral + pnl);
   return pnl;
 }
-
 function closeOppositePositions(u, symbol, newSide, closePrice) {
   const keep = [];
   let realized = 0;
-  for (const p of Array.isArray(u.positions) ? u.positions : []) {
-    if (p.symbol !== symbol) {
-      keep.push(p);
-      continue;
-    }
-    if (p.side === newSide) {
-      keep.push(p);
-      continue;
-    }
+  for (const p of (Array.isArray(u.positions) ? u.positions : [])) {
+    if (p.symbol !== symbol || p.side === newSide) { keep.push(p); continue; }
     realized += closePosition(u, p, closePrice);
   }
   u.positions = keep;
   return realized;
 }
-
-function closeAllPositions(u, feedJson) {
-  const keep = [];
-  let realized = 0;
-  for (const p of Array.isArray(u.positions) ? u.positions : []) {
-    const closePrice = latestPriceBySymbol(feedJson, p.symbol);
-    if (!closePrice) {
-      keep.push(p);
-      continue;
-    }
-    realized += closePosition(u, p, closePrice);
-  }
-  u.positions = keep;
-  return realized;
-}
-
-function openPaperPosition(u, { symbol, side, entry }, collateral) {
+function openPaperPosition(u, sig, collateral) {
   if (!Array.isArray(u.positions)) u.positions = [];
   const c = Math.floor(Math.max(0, Math.min(collateral, u.paperUSDC)) * 100) / 100;
   if (c <= 0) return { ok: false, reason: 'Insufficient paper balance' };
   u.paperUSDC -= c;
   u.positions.push({
-    symbol: String(symbol).toUpperCase(),
-    side: String(side).toUpperCase(),
-    entry: Number(entry),
+    symbol: String(sig.symbol).toUpperCase(),
+    side: String(sig.side).toUpperCase(),
+    entry: Number(sig.entry),
     leverage: Number(u.risk),
     collateral: c,
     ts: Date.now(),
   });
   return { ok: true, used: c };
 }
-
 function estimatePnL(u, feedJson) {
   const positions = Array.isArray(u.positions) ? u.positions : [];
   let pnl = 0;
@@ -270,8 +350,7 @@ function estimatePnL(u, feedJson) {
   return pnl;
 }
 
-/* ===================== SIGNAL INGEST ===================== */
-
+/* ========== Signal fetch & parsing ========== */
 function pickLatest(feedJson) {
   const f = feedJson?.forecast_today_hourly || {};
   const items = [];
@@ -282,123 +361,30 @@ function pickLatest(feedJson) {
     items.push({ symbol: k, ...last, _t: new Date(last.time).getTime() || 0 });
   }
   if (!items.length) return null;
-  items.sort((a, b) => b._t - a._t);
-  const top = items[0];
+  items.sort((a,b)=>b._t - a._t);
+  const t = items[0];
   return {
-    symbol: String(top.symbol).toUpperCase(),
-    side: String(top.signal || '').toUpperCase(),
-    entry: Number(top.entry_price),
-    stop_loss: Number(top.stop_loss ?? 0),
-    take_profit: Number(top.take_profit ?? 0),
-    time: top.time,
+    symbol: String(t.symbol).toUpperCase(),
+    side: String(t.signal || '').toUpperCase(),
+    entry: Number(t.entry_price),
+    stop_loss: Number(t.stop_loss ?? 0),
+    take_profit: Number(t.take_profit ?? 0),
+    time: t.time,
   };
 }
-
 async function fetchLatestSignal() {
-  try {
-    const r = await fetch(SIGNAL_FEED_URL, { timeout: 5000 });
-    if (!r.ok) throw new Error(`Signal feed HTTP ${r.status}`);
-    const js = await r.json();
-    return { latest: pickLatest(js), raw: js };
-  } catch (e) {
-    console.error('Fetch signal failed:', e.message);
-    throw e;
-  }
+  const r = await fetch(SIGNAL_FEED_URL, { timeout: 8000 });
+  if (!r.ok) throw new Error(`Signal feed HTTP ${r.status}`);
+  const js = await r.json();
+  return { raw: js, latest: pickLatest(js) };
 }
-
 const feedKey = (s) => (s ? `${s.symbol}-${s.time}-${s.side}-${s.entry}` : null);
 
-/* ===================== On-chain Signal Posting ===================== */
-
-function sha3_256_hex(buf) {
-  return crypto.createHash('sha256').update(buf).digest('hex');
-}
-
-function deriveSignalKey32() {
-  if (SIGNAL_KEY_HEX && /^[0-9a-fA-Fx]{64,66}$/.test(SIGNAL_KEY_HEX)) {
-    return Buffer.from(SIGNAL_KEY_HEX.replace(/^0x/, ''), 'hex');
-  }
-  const adminRaw = Buffer.from(normEd25519Key(ADMIN_PRIVATE_KEY).replace(/^0x/, ''), 'hex');
-  return crypto.createHash('sha256').update(adminRaw).digest();
-}
-
-function aeadEncryptAESGCM(key32, plaintextBuf, aadStr = 'teletrade') {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key32, iv);
-  cipher.setAAD(Buffer.from(aadStr));
-  const ciphertext = Buffer.concat([cipher.update(plaintextBuf), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return { iv, aad: Buffer.from(aadStr), ciphertext, tag };
-}
-
-async function txAdmin(data, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const tx = await aptos.transaction.build.simple({ sender: admin.accountAddress, data });
-      const sub = await aptos.signAndSubmitTransaction({ signer: admin, transaction: tx });
-      const result = await aptos.waitForTransaction({ transactionHash: sub.hash });
-      console.log(`On-chain post successful: ${sub.hash}`);
-      return { ok: true, hash: sub.hash };
-    } catch (e) {
-      console.error(`On-chain post attempt ${i + 1} failed:`, e.message);
-      if (i === retries - 1) throw e;
-      await wait(1000 * (2 ** i));
-    }
-  }
-}
-
-async function postSignalOnchainAuto(encPack) {
-  if (!MODULE_ADDR) return { ok: false, reason: 'MODULE_ADDR not set' };
-
-  const hex = (b) => '0x' + Buffer.from(b).toString('hex');
-  const hash = sha3_256_hex(encPack.plain).slice(0, 64);
-
-  const attempts = [
-    {
-      fn: `${MODULE_ADDR}::signal_vault::post_signal`,
-      args: [
-        to0x(admin.accountAddress.toString()),
-        to0x(hash),
-        to0x(hash),
-        hex(encPack.ciphertext),
-        hex(encPack.iv),
-        hex(encPack.aad),
-        hex(encPack.tag),
-        BigInt(encPack.ts),
-      ],
-    },
-    {
-      fn: `${MODULE_ADDR}::signal_vault::post_encrypted_signal`,
-      args: [hex(encPack.ciphertext), BigInt(encPack.ts)],
-    },
-    {
-      fn: `${MODULE_ADDR}::signal_vault::post_encrypted_signal`,
-      args: [
-        to0x(admin.accountAddress.toString()),
-        hex(encPack.ciphertext),
-        BigInt(encPack.ts),
-      ],
-    },
-  ];
-
-  for (const a of attempts) {
-    try {
-      const payload = { function: a.fn, typeArguments: [], functionArguments: a.args };
-      const res = await txAdmin(payload);
-      return res;
-    } catch (e) {
-      console.warn(`Function ${a.fn} failed:`, e.message);
-    }
-  }
-  return { ok: false, reason: 'All post variants failed' };
-}
-
-/* ===================== UI Helpers ===================== */
-
+/* ========== UI helpers ========== */
 const MAIN_KB = Markup.keyboard([
   ['/portfolio', '/riskfactor'],
   ['/size', '/stop', '/closeall'],
-  ['/monitor'],
+  ['/monitor', '/link_agent', '/deposit', '/debug'],
 ]).resize();
 
 const RISK_INLINE = Markup.inlineKeyboard([
@@ -420,26 +406,51 @@ const greenRed = (side) => (side === 'LONG' ? '🟢 LONG' : side === 'SHORT' ? '
 const blueTime = (iso) => `🔵 ${iso}`;
 const renderSignalLine = (s) => (s ? `${greenRed(s.side)} ${s.symbol} @ ${s.entry}\n${blueTime(s.time)}` : '');
 
-/* ===================== TELEGRAM ===================== */
-
+/* ========== Telegram bot ========== */
 const bot = new Telegraf(BOT_TOKEN);
 
-// Rate limit for faucet to prevent abuse
-const faucetRateLimit = new Map();
-const FAUCET_COOLDOWN = 60 * 60 * 1000; // 1 hour
-
-// /start
+/* ----- /start: admin-or-user bootstrap ----- */
 bot.start(async (ctx) => {
   const tid = String(ctx.from.id);
-  const first = !users[tid];
-  const u = ensureUser(tid);
-  await saveJson(USERS_PATH, users);
+  const firstEver = !state.admin_tg_id;
 
-  if (first && !faucetRateLimit.has(tid)) {
-    faucetRateLimit.set(tid, Date.now());
-    faucetFund(u.addr).catch((e) => console.error(`Faucet fund failed for ${u.addr}:`, e.message));
+  // Designate first /start as admin
+  if (firstEver) {
+    state.admin_tg_id = tid;
+    await saveJson(STATE_PATH, state);
   }
 
+  // Bind user record
+  const u = ensureUser(tid);
+
+  // If this is the admin, make sure agent exists (one-time) and show wallet
+  if (tid === state.admin_tg_id) {
+    // write back stable admin record
+    users[tid] = sanitizeUser({ ...u, addr: ADMIN_ADDR, pk: ADMIN_KEY_NORM, isAdmin: true });
+    await saveJson(USERS_PATH, users);
+
+    // auto register agent if missing
+    try {
+      const r = await registerAgentIfNeeded(10, '0x');
+      if (!r.already) console.log(`Agent registered: ${r.hash}`);
+    } catch (e) {
+      console.error('Auto register agent failed:', e.message);
+    }
+  }
+
+  // Try funding user if needed (polite; skip if recently funded)
+  await ensureFaucet(tid, u.addr).catch(()=>{});
+
+  // Auto-link user to agent if needed
+  try {
+    const userAcc = Account.fromPrivateKey({ privateKey: new Ed25519PrivateKey(normEd25519Key(u.pk)) });
+    await registerAgentIfNeeded().catch(()=>{});
+    await linkUserIfNeeded(userAcc).catch(()=>{});
+  } catch (e) {
+    console.error('Auto link failed:', e.message);
+  }
+
+  // Show head + ask for position size if not set
   let sigLine = '';
   try {
     const { latest } = await fetchLatestSignal();
@@ -452,10 +463,7 @@ bot.start(async (ctx) => {
     `📡 Signal monitoring: <b>${u.monitor ? 'ON' : 'OFF'}</b>${sigLine}`;
 
   if (!u.alloc) {
-    await ctx.replyWithHTML(head + `\n\nChoose position size per signal:`, {
-      ...MAIN_KB,
-      ...ALLOC_INLINE,
-    });
+    await ctx.replyWithHTML(head + `\n\nChoose position size per signal:`, { ...MAIN_KB, ...ALLOC_INLINE });
   } else {
     await ctx.replyWithHTML(
       head + `\n\nPosition size: <b>${Math.round(u.alloc * 100)}%</b> of paper balance`,
@@ -464,111 +472,79 @@ bot.start(async (ctx) => {
   }
 });
 
-// /stop
+/* ----- Toggles & settings ----- */
 bot.command('stop', async (ctx) => {
   const u = ensureUser(String(ctx.from.id));
-  u.auto = false;
-  await saveJson(USERS_PATH, users);
+  u.auto = false; await saveJson(USERS_PATH, users);
   await ctx.reply('🔴 Auto paper trading: OFF', MAIN_KB);
 });
 
-// /monitor
 bot.command('monitor', async (ctx) => {
   const u = ensureUser(String(ctx.from.id));
   await ctx.reply(
     `📡 Signal monitoring: <b>${u.monitor ? 'ON' : 'OFF'}</b>\nChoose monitoring status:`,
-    { ...MAIN_KB, ...MONITOR_INLINE }
+    { parse_mode: 'HTML', ...MAIN_KB, ...MONITOR_INLINE }
   );
 });
-
-// /monitor action
 bot.action(/monitor:(on|off)/, async (ctx) => {
-  try {
-    const status = ctx.match[1] === 'on';
-    const u = ensureUser(String(ctx.from.id));
-    u.monitor = status;
-    await saveJson(USERS_PATH, users);
-    await ctx.answerCbQuery(`Monitoring ${status ? 'enabled' : 'disabled'}`);
-    await ctx.editMessageText(
-      `📡 Signal monitoring set to <b>${status ? 'ON' : 'OFF'}</b>`,
-      { parse_mode: 'HTML', ...MAIN_KB }
-    );
-  } catch {
-    await ctx.answerCbQuery('Error setting monitoring status');
-  }
+  const tid = String(ctx.from.id);
+  const u = ensureUser(tid);
+  const status = ctx.match[1] === 'on';
+  u.monitor = status; await saveJson(USERS_PATH, users);
+  await ctx.answerCbQuery(`Monitoring ${status ? 'enabled' : 'disabled'}`);
+  await ctx.editMessageText(`📡 Signal monitoring set to <b>${status ? 'ON' : 'OFF'}</b>`, { parse_mode: 'HTML', ...MAIN_KB });
 });
 
-// /size
 bot.command('size', async (ctx) => {
   ensureUser(String(ctx.from.id));
-  await ctx.reply('Pick how much of your paper balance to use per signal:', {
-    ...MAIN_KB,
-    ...ALLOC_INLINE,
-  });
+  await ctx.reply('Pick how much of your paper balance to use per signal:', { ...MAIN_KB, ...ALLOC_INLINE });
 });
-
-// /alloc
 bot.action(/alloc:(.+)/, async (ctx) => {
-  try {
-    const frac = Number(ctx.match[1]);
-    const u = ensureUser(String(ctx.from.id));
-    if (frac > 0 && frac <= 1) {
-      u.alloc = frac;
-      await saveJson(USERS_PATH, users);
-      await ctx.answerCbQuery('Position size saved');
-      await ctx.editMessageText(`✅ Position size set to ${Math.round(frac * 100)}% of paper balance`, MAIN_KB);
-    } else {
-      await ctx.answerCbQuery('Invalid size');
-    }
-  } catch {
-    await ctx.answerCbQuery('Error setting size');
+  const tid = String(ctx.from.id);
+  const u = ensureUser(tid);
+  const frac = Number(ctx.match[1]);
+  if (frac > 0 && frac <= 1) {
+    u.alloc = frac; await saveJson(USERS_PATH, users);
+    await ctx.answerCbQuery('Position size saved');
+    await ctx.editMessageText(`✅ Position size set to ${Math.round(frac * 100)}% of paper balance`, MAIN_KB);
+  } else {
+    await ctx.answerCbQuery('Invalid size');
   }
 });
 
-// /riskfactor
 bot.command('riskfactor', async (ctx) => {
   const u = ensureUser(String(ctx.from.id));
   const parts = ctx.message.text.trim().split(/\s+/);
   const n = Number(parts[1]);
-
   if (Number.isFinite(n) && n >= 1 && n <= 100) {
-    u.risk = Math.floor(n);
-    await saveJson(USERS_PATH, users);
+    u.risk = Math.floor(n); await saveJson(USERS_PATH, users);
     await ctx.reply(`✅ Risk factor set to ${u.risk}x`, MAIN_KB);
   } else {
     await ctx.reply('Choose your risk (leverage):', { ...MAIN_KB, ...RISK_INLINE });
   }
 });
-
-// /rf
 bot.action(/rf:(\d+)/, async (ctx) => {
-  try {
-    const lev = Number(ctx.match[1] || '0');
-    const u = ensureUser(String(ctx.from.id));
-    if (lev >= 1 && lev <= 100) {
-      u.risk = lev;
-      await saveJson(USERS_PATH, users);
-      await ctx.answerCbQuery('Updated!');
-      await ctx.editMessageText(`✅ Risk factor set to ${u.risk}x`, MAIN_KB);
-    } else {
-      await ctx.answerCbQuery('Invalid');
-    }
-  } catch {
-    await ctx.answerCbQuery('Error setting risk');
+  const tid = String(ctx.from.id);
+  const u = ensureUser(tid);
+  const lev = Number(ctx.match[1] || '0');
+  if (lev >= 1 && lev <= 100) {
+    u.risk = lev; await saveJson(USERS_PATH, users);
+    await ctx.answerCbQuery('Updated!');
+    await ctx.editMessageText(`✅ Risk factor set to ${u.risk}x`, MAIN_KB);
+  } else {
+    await ctx.answerCbQuery('Invalid');
   }
 });
 
-// /portfolio
+/* ----- Portfolio & maintenance ----- */
 bot.command('portfolio', async (ctx) => {
   try {
     const tid = String(ctx.from.id);
     const u = ensureUser(tid);
-
     const [{ raw, latest }, apt] = await Promise.all([
       fetchLatestSignal().catch(() => ({ raw: null, latest: null })),
       getAptBalance(u.addr),
     ]);
-
     const positions = Array.isArray(u.positions) ? u.positions : [];
     const pnl = raw ? estimatePnL(u, raw) : 0;
 
@@ -581,189 +557,180 @@ bot.command('portfolio', async (ctx) => {
       `Auto trading: ${u.auto ? 'ON' : 'OFF'}  •  Monitoring: ${u.monitor ? 'ON' : 'OFF'}`,
       `Open positions: ${positions.length}`,
     ];
-
-    if (raw && positions.length) {
-      lines.push(`📊 Est. P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USDC`);
-    }
-
-    if (latest) {
-      lines.push(
-        ``,
-        `<b>Latest signal</b>`,
-        renderSignalLine(latest),
-      );
-    }
+    if (raw && positions.length) lines.push(`📊 Est. P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USDC`);
+    if (latest) lines.push('', `<b>Latest signal</b>`, renderSignalLine(latest));
 
     await ctx.replyWithHTML(lines.filter(Boolean).join('\n'), MAIN_KB);
   } catch (e) {
-    console.error('Portfolio error:', e.message);
     await ctx.reply('❌ Portfolio error. Try again.', MAIN_KB);
   }
 });
 
-// /closeall
 bot.command('closeall', async (ctx) => {
   try {
     const tid = String(ctx.from.id);
     const u = ensureUser(tid);
     const { raw } = await fetchLatestSignal().catch(() => ({ raw: null }));
-    const realized = raw ? closeAllPositions(u, raw) : 0;
+    let realized = 0;
+    if (raw) realized = closeAllPositions(u, raw);
     await saveJson(USERS_PATH, users);
     await ctx.replyWithHTML(
       `✅ Closed all positions\nRealized P&L: ${realized >= 0 ? '+' : ''}${realized.toFixed(2)} USDC\n` +
       `New paper balance: ${u.paperUSDC.toFixed(2)} USDC`,
       MAIN_KB
     );
-  } catch (e) {
-    console.error('Close all error:', e.message);
-    await ctx.reply('❌ Error closing positions. Try again.', MAIN_KB);
+  } catch {
+    await ctx.reply('❌ Error closing positions.', MAIN_KB);
   }
 });
 
-// /ping
-bot.hears(/^\/ping$/i, (ctx) => ctx.reply('pong', MAIN_KB));
+/* ----- Link agent (manual override if needed) ----- */
+bot.command('link_agent', async (ctx) => {
+  try {
+    const tid = String(ctx.from.id);
+    const u = ensureUser(tid);
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const agentAddr = (parts[1] && parts[1].startsWith('0x')) ? parts[1] : ADMIN_ADDR;
 
-// /menu
-bot.hears(/^\/menu$/i, (ctx) => ctx.reply('📋 Menu', MAIN_KB));
+    const userAcc = Account.fromPrivateKey({ privateKey: new Ed25519PrivateKey(normEd25519Key(u.pk)) });
+    await registerAgentIfNeeded().catch(()=>{});
+    const r = await linkUserIfNeeded(userAcc);
+    await ctx.replyWithHTML(
+      r.already
+        ? `🔗 Already linked to agent <code>${agentAddr}</code>`
+        : `✅ Linked to agent <code>${agentAddr}</code>`,
+      { parse_mode: 'HTML', ...MAIN_KB }
+    );
+  } catch (e) {
+    await ctx.reply(`❌ Link agent error: ${e.message}`, MAIN_KB);
+  }
+});
 
-// Error handler
+/* ----- Deposit demo (placeholder function) ----- */
+bot.command('deposit', async (ctx) => {
+  await ctx.reply('Deposit function is a placeholder; wire to your Move entry if needed.', MAIN_KB);
+});
+
+/* ----- Debug ----- */
+bot.command('debug', async (ctx) => {
+  const tid = String(ctx.from.id);
+  const u = ensureUser(tid);
+  const apt = await getAptBalance(u.addr);
+  await ctx.replyWithHTML(
+    `<b>Debug</b>\n` +
+    `TG: ${tid}\n` +
+    `isAdmin: ${u.isAdmin}\n` +
+    `Addr: <code>${esc(u.addr)}</code>\n` +
+    `APT: ${apt.toFixed(8)}\n` +
+    `Paper: ${u.paperUSDC.toFixed(2)}\n`,
+    MAIN_KB
+  );
+});
+
+/* ----- Error handler ----- */
 bot.catch((err, ctx) => {
   console.error('Bot error:', err.message);
-  ctx.reply('❌ Unexpected error.', MAIN_KB).catch(() => {});
+  ctx.reply('❌ Unexpected error.', MAIN_KB).catch(()=>{});
 });
 
-/* ===================== POLLER ===================== */
-
-const POLL_MS = Math.max(10_000, Number(SIGNAL_POLL_MS) || 60_000);
-const key32 = deriveSignalKey32();
-
+/* ========== Poller: monitor, auto-trade, on-chain post (as user) ========== */
 async function handleNewSignalPack({ latest, raw }) {
   const key = feedKey(latest);
-  const isNewSignal = key && state.lastFeedKey !== key;
+  if (key && state.lastFeedKey === key) return;
+  if (key) { state.lastFeedKey = key; await saveJson(STATE_PATH, state); }
 
-  // Notify users with monitoring enabled
-  for (const [tid, _u] of Object.entries(users)) {
+  // broadcast monitoring ping
+  for (const [tid, _] of Object.entries(users)) {
     const u = ensureUser(tid);
     if (!u.monitor) continue;
-
-    try {
-      if (!latest) {
-        await bot.telegram.sendMessage(
-          tid,
-          '📡 Bot is monitoring signals...\n<b>No signal available</b>',
-          { parse_mode: 'HTML', ...MAIN_KB }
-        );
-      } else if (!isNewSignal) {
-        await bot.telegram.sendMessage(
-          tid,
-          `📡 Bot is monitoring signals...\n<b>No new signal detected</b>\nLatest: ${renderSignalLine(latest)}`,
-          { parse_mode: 'HTML', ...MAIN_KB }
-        );
-      } else {
-        await bot.telegram.sendMessage(
-          tid,
-          `📡 Bot is monitoring signals...\n<b>New signal detected!</b>\n${renderSignalLine(latest)}`,
-          { parse_mode: 'HTML', ...MAIN_KB }
-        );
-      }
-    } catch (e) {
-      console.error(`Failed to notify user ${tid} for monitoring:`, e.message);
-    }
+    const text = latest
+      ? `📡 Bot is monitoring signals...\n<b>Latest signal</b>\n${renderSignalLine(latest)}`
+      : `📡 Bot is monitoring signals...\n<b>No signal</b>`;
+    try { await bot.telegram.sendMessage(tid, text, { parse_mode: 'HTML', ...MAIN_KB }); } catch {}
   }
 
-  if (!isNewSignal || !latest) return;
-  state.lastFeedKey = key;
-  await saveJson(STATE_PATH, state);
+  if (!latest) return;
 
-  // Post signal on-chain
-  if (MODULE_ADDR) {
-    const plain = Buffer.from(JSON.stringify(latest));
-    const enc = aeadEncryptAESGCM(key32, plain, 'teletrade');
-    const encPack = { ...enc, plain, ts: Math.floor(Date.now() / 1000) };
-    const res = await postSignalOnchainAuto(encPack);
-    if (!res.ok) {
-      console.error('On-chain post failed:', res.reason);
-    } else {
-      console.log(`Signal posted on-chain: ${res.hash}`);
-    }
-  }
-
-  // Paper trades for all auto-enabled users
-  let changed = false;
-  for (const [tid, _u] of Object.entries(users)) {
+  // Auto-trade users
+  let touched = false;
+  for (const [tid,_] of Object.entries(users)) {
     const u = ensureUser(tid);
     if (!u.auto) continue;
 
+    // Require alloc (position size)
     if (!u.alloc) {
       try {
-        await bot.telegram.sendMessage(
-          tid,
-          'Please select your position size before auto-trading:',
-          { ...MAIN_KB, ...ALLOC_INLINE }
-        );
+        await bot.telegram.sendMessage(tid, 'Please select your position size before auto-trading:', { ...MAIN_KB, ...ALLOC_INLINE });
       } catch {}
       continue;
     }
 
-    // Close opposite positions
-    const closePnl = closeOppositePositions(u, latest.symbol, latest.side, latest.entry);
-
-    // Open new position
-    const collateral = Math.floor(u.paperUSDC * u.alloc * 100) / 100;
-    const r = openPaperPosition(u, latest, collateral);
-    changed = true;
-
+    // Ensure on-chain pre-reqs for posting signals: agent exists, user linked, gas present
     try {
+      await registerAgentIfNeeded().catch(()=>{});
+      const userAcc = Account.fromPrivateKey({ privateKey: new Ed25519PrivateKey(normEd25519Key(u.pk)) });
+
+      // gas: faucet if low
+      const bal = await getAptBalance(u.addr);
+      if (bal < 0.01) await ensureFaucet(tid, u.addr);
+
+      await linkUserIfNeeded(userAcc).catch(()=>{});
+
+      // Paper: close opposite then open new
+      const realized = closeOppositePositions(u, latest.symbol, latest.side, latest.entry);
+      const collateral = Math.floor(u.paperUSDC * u.alloc * 100) / 100;
+      const r = openPaperPosition(u, latest, collateral);
+      touched = true;
+
+      // Post the signal on-chain as the user
+      try {
+        const hash = await postSignal_user(userAcc, ADMIN_ADDR, {
+          symbol: latest.symbol,
+          side: latest.side,
+          entry: latest.entry,
+          time: latest.time,
+          auto: true,
+        });
+        console.log(`On-chain post (user ${tid}): ${hash}`);
+      } catch (e) {
+        console.error(`On-chain post failed for user ${tid}:`, e.message);
+      }
+
       const recap =
-        (closePnl ? `💱 Realized P&L on ${latest.symbol}: ${closePnl >= 0 ? '+' : ''}${closePnl.toFixed(2)} USDC\n` : '') +
+        (realized ? `💱 Realized P&L on ${latest.symbol}: ${realized >= 0 ? '+' : ''}${realized.toFixed(2)} USDC\n` : '') +
         (r.ok
           ? `✅ PAPER ${greenRed(latest.side)} ${latest.symbol} @ ${latest.entry}\n` +
             `Collateral: ${r.used?.toFixed(2)} USDC • Leverage: ${u.risk}x\n` +
             `${blueTime(latest.time)}\n` +
             `New paper balance: ${u.paperUSDC.toFixed(2)} USDC`
           : `⚠️ Skipped trade: ${r.reason}`);
-      await bot.telegram.sendMessage(tid, recap, { parse_mode: 'HTML', ...MAIN_KB });
+
+      try {
+        await bot.telegram.sendMessage(tid, recap, { parse_mode: 'HTML', ...MAIN_KB });
+      } catch {}
     } catch (e) {
-      console.error(`Failed to notify user ${tid}:`, e.message);
+      console.error(`Auto-trade error for ${tid}:`, e.message);
     }
   }
-  if (changed) await saveJson(USERS_PATH, users);
+  if (touched) await saveJson(USERS_PATH, users);
 }
 
 async function pollLoop() {
   console.log(`[Bot] running on ${net.toUpperCase()}`);
-  console.log('Admin:', admin.accountAddress.toString());
-
-  let backoff = POLL_MS;
+  console.log('Admin:', ADMIN_ADDR);
   while (true) {
     try {
       const pack = await fetchLatestSignal();
       await handleNewSignalPack(pack);
-      backoff = POLL_MS; // Reset backoff on success
+      await wait(Math.max(10_000, Number(SIGNAL_POLL_MS) || 60_000));
     } catch (e) {
       console.error('Poll error:', e.message);
-      // Notify users with monitoring enabled about failure
-      for (const [tid, _u] of Object.entries(users)) {
-        const u = ensureUser(tid);
-        if (!u.monitor) continue;
-        try {
-          await bot.telegram.sendMessage(
-            tid,
-            '📡 Bot is monitoring signals...\n<b>Signal feed unavailable</b>',
-            { parse_mode: 'HTML', ...MAIN_KB }
-          );
-        } catch (e) {
-          console.error(`Failed to notify user ${tid} for monitoring error:`, e.message);
-        }
-      }
-      backoff = Math.min(backoff * 2, 300_000); // Max 5 min
+      await wait(20_000);
     }
-    await wait(backoff);
   }
 }
 
-/* ===================== BOOT ===================== */
-
+/* ========== Boot ========== */
 bot.launch().then(() => {
   console.log('Bot launched ✅');
   pollLoop();
@@ -774,3 +741,4 @@ bot.launch().then(() => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+

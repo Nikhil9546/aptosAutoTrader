@@ -1,22 +1,11 @@
 {
   "828537097": {
-    "addr": "0x2b739c1fc0c924355e55bd18fbf5a0913dbf7175c58028696e51ab52295ba176",
-    "pk": "ed25519-priv-0x75d2d93c85fe40392ac7e2cf90484a90a9e6505a9ccd323f59b7c0da1f6be3e7",
-    "auto": false,
-    "risk": 2,
-    "paperUSDC": 10000,
-    "positions": [],
-    "alloc": 0.5,
-    "realized": 0,
-    "_fundAttempted": true,
-    "monitor": true
-  },
-  "1204682163": {
-    "addr": "0xfffd3fe891e9bcc5c812bfbe86954bd79dbca4f20bde127a908b1284e4e6f370",
-    "pk": "ed25519-priv-0xcb378daef2f2032c6a0ce9080b2dce7f2971c5a72890aedaefdf8bd1da66894a",
+    "addr": "0xc15ccf35138f0f6ca4c498d3c17f80e3497bd9b150b0c126f02b326eb05b7255",
+    "pk": "0x58ea08062c936b163534d022c85bc22d1dbaa5a8cdc5685e5876ee5f720e0d1d",
+    "isAdmin": true,
     "auto": true,
-    "monitor": false,
-    "risk": 5,
+    "monitor": true,
+    "risk": 2,
     "paperUSDC": 10000,
     "positions": [],
     "alloc": 0.25

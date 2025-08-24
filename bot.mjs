@@ -43,7 +43,7 @@ if (!SIGNAL_KEY_HEX) {
 /* ===================== APTOS CLIENT ===================== */
 
 const nodeUrl = APTOS_FULLNODE_URL || APTOS_NODE_URL;
-const net = APTOS_NETWORK.toLowerCase(); // Moved net definition here
+const net = (APTOS_NETWORK || 'testnet').toLowerCase();
 const aptosConfig =
   net === 'mainnet'
     ? new AptosConfig({ network: Network.MAINNET })
@@ -71,6 +71,7 @@ try {
   console.error('Invalid ADMIN_PRIVATE_KEY:', e.message);
   process.exit(1);
 }
+const ADMIN_ADDR = admin.accountAddress.toString();
 
 /* ===================== STORAGE ===================== */
 
@@ -336,61 +337,92 @@ async function txAdmin(data, retries = 3) {
     try {
       const tx = await aptos.transaction.build.simple({ sender: admin.accountAddress, data });
       const sub = await aptos.signAndSubmitTransaction({ signer: admin, transaction: tx });
-      const result = await aptos.waitForTransaction({ transactionHash: sub.hash });
-      console.log(`On-chain post successful: ${sub.hash}`);
+      await aptos.waitForTransaction({ transactionHash: sub.hash });
+      console.log(`Admin tx OK: ${sub.hash}`);
       return { ok: true, hash: sub.hash };
     } catch (e) {
-      console.error(`On-chain post attempt ${i + 1} failed:`, e.message);
+      console.error(`Admin tx attempt ${i + 1} failed:`, e.message);
       if (i === retries - 1) throw e;
       await wait(1000 * (2 ** i));
     }
   }
 }
 
-async function postSignalOnchainAuto(encPack) {
-  if (!MODULE_ADDR) return { ok: false, reason: 'MODULE_ADDR not set' };
-
-  const hex = (b) => '0x' + Buffer.from(b).toString('hex');
-  const hash = sha3_256_hex(encPack.plain).slice(0, 64);
-
-  const attempts = [
-    {
-      fn: `${MODULE_ADDR}::signal_vault::post_signal`,
-      args: [
-        to0x(admin.accountAddress.toString()),
-        to0x(hash),
-        to0x(hash),
-        hex(encPack.ciphertext),
-        hex(encPack.iv),
-        hex(encPack.aad),
-        hex(encPack.tag),
-        BigInt(encPack.ts),
-      ],
-    },
-    {
-      fn: `${MODULE_ADDR}::signal_vault::post_encrypted_signal`,
-      args: [hex(encPack.ciphertext), BigInt(encPack.ts)],
-    },
-    {
-      fn: `${MODULE_ADDR}::signal_vault::post_encrypted_signal`,
-      args: [
-        to0x(admin.accountAddress.toString()),
-        hex(encPack.ciphertext),
-        BigInt(encPack.ts),
-      ],
-    },
-  ];
-
-  for (const a of attempts) {
+// === ADDED: generic user tx helper (used for linking) ===
+async function txUser(account, data, retries = 3) {
+  for (let i = 0; i < retries; i++) {
     try {
-      const payload = { function: a.fn, typeArguments: [], functionArguments: a.args };
-      const res = await txAdmin(payload);
-      return res;
+      const tx = await aptos.transaction.build.simple({ sender: account.accountAddress, data });
+      const sub = await aptos.signAndSubmitTransaction({ signer: account, transaction: tx });
+      await aptos.waitForTransaction({ transactionHash: sub.hash });
+      console.log(`User tx OK: ${sub.hash}`);
+      return { ok: true, hash: sub.hash };
     } catch (e) {
-      console.warn(`Function ${a.fn} failed:`, e.message);
+      console.error(`User tx attempt ${i + 1} failed:`, e.message);
+      if (i === retries - 1) throw e;
+      await wait(1000 * (2 ** i));
     }
   }
-  return { ok: false, reason: 'All post variants failed' };
+}
+
+/* ---------- ADDED: Agent/Link helpers (only flow change) ---------- */
+
+async function hasAgentResource(addr) {
+  if (!MODULE_ADDR) return false;
+  try {
+    await aptos.getAccountResource({
+      accountAddress: addr,
+      resourceType: `${MODULE_ADDR}::agent_registry::Agent`,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getUserConfig(addr) {
+  if (!MODULE_ADDR) return null;
+  try {
+    const res = await aptos.getAccountResource({
+      accountAddress: addr,
+      resourceType: `${MODULE_ADDR}::agent_registry::UserConfig`,
+    });
+    const agent = `0x${res.data.agent.inner}`;
+    const leverage = Number(res.data.leverage);
+    const mode = Number(res.data.mode);
+    return { agent, leverage, mode };
+  } catch {
+    return null;
+  }
+}
+
+async function registerAgentIfNeeded(maxLev = 10, metadataHex = '0x') {
+  if (!MODULE_ADDR) return;
+  if (await hasAgentResource(ADMIN_ADDR)) return;
+  const pubBytes = new Ed25519PrivateKey(normEd25519Key(ADMIN_PRIVATE_KEY)).publicKey().toUint8Array();
+  const payload = {
+    function: `${MODULE_ADDR}::agent_registry::register_agent`,
+    typeArguments: [],
+    functionArguments: [
+      `0x${Buffer.from(pubBytes).toString('hex')}`, // pubkey vector<u8>
+      BigInt(maxLev),
+      metadataHex,
+    ],
+  };
+  await txAdmin(payload);
+}
+
+async function linkUserToAgentIfNeeded(userAcc) {
+  if (!MODULE_ADDR) return;
+  const addr = userAcc.accountAddress.toString();
+  const cfg = await getUserConfig(addr);
+  if (cfg && cfg.agent.toLowerCase() === ADMIN_ADDR.toLowerCase()) return;
+  const payload = {
+    function: `${MODULE_ADDR}::agent_registry::link_user`,
+    typeArguments: [],
+    functionArguments: [ADMIN_ADDR],
+  };
+  await txUser(userAcc, payload);
 }
 
 /* ===================== UI Helpers ===================== */
@@ -435,10 +467,28 @@ bot.start(async (ctx) => {
   const u = ensureUser(tid);
   await saveJson(USERS_PATH, users);
 
-  if (first && !faucetRateLimit.has(tid)) {
-    faucetRateLimit.set(tid, Date.now());
-    faucetFund(u.addr).catch((e) => console.error(`Faucet fund failed for ${u.addr}:`, e.message));
+  // === Only flow change: ensure agent exists, then link this user to the agent ===
+  try {
+    if (MODULE_ADDR) {
+      // Make sure admin is an agent (one-time)
+      await registerAgentIfNeeded();
+
+      // Fund user on first touch (for gas), then link
+      if (first && !faucetRateLimit.has(tid)) {
+        faucetRateLimit.set(tid, Date.now());
+        faucetFund(u.addr).catch((e) => console.error(`Faucet fund failed for ${u.addr}:`, e.message));
+      }
+      const userAcc = Account.fromPrivateKey({ privateKey: new Ed25519PrivateKey(normEd25519Key(u.pk)) });
+      await linkUserToAgentIfNeeded(userAcc);
+
+      // Also link admin to self (so admin can post if needed)
+      const adminAcc = admin;
+      await linkUserToAgentIfNeeded(adminAcc).catch(() => {});
+    }
+  } catch (e) {
+    console.error('Auto agent-register/link flow error:', e.message);
   }
+  // === end of flow change ===
 
   let sigLine = '';
   try {
@@ -637,6 +687,30 @@ bot.catch((err, ctx) => {
 const POLL_MS = Math.max(10_000, Number(SIGNAL_POLL_MS) || 60_000);
 const key32 = deriveSignalKey32();
 
+async function postSignalOnchainAuto(encPack) {
+  if (!MODULE_ADDR) return { ok: false, reason: 'MODULE_ADDR not set' };
+
+  const hex = (b) => '0x' + Buffer.from(b).toString('hex');
+  const hash = sha3_256_hex(encPack.plain).slice(0, 64);
+
+  const payload = {
+    function: `${MODULE_ADDR}::signal_vault::post_signal`,
+    typeArguments: [],
+    functionArguments: [
+      to0x(admin.accountAddress.toString()),
+      to0x(hash),
+      to0x(hash),
+      hex(encPack.ciphertext),
+      hex(encPack.iv),
+      hex(encPack.aad),
+      hex(encPack.tag),
+      BigInt(encPack.ts),
+    ],
+  };
+  // (UI unchanged; we just reuse existing admin-posting path)
+  return txAdmin(payload);
+}
+
 async function handleNewSignalPack({ latest, raw }) {
   const key = feedKey(latest);
   const isNewSignal = key && state.lastFeedKey !== key;
@@ -675,14 +749,14 @@ async function handleNewSignalPack({ latest, raw }) {
   state.lastFeedKey = key;
   await saveJson(STATE_PATH, state);
 
-  // Post signal on-chain
+  // On-chain post (admin path retained; flow tweak above ensures admin is also linked)
   if (MODULE_ADDR) {
     const plain = Buffer.from(JSON.stringify(latest));
     const enc = aeadEncryptAESGCM(key32, plain, 'teletrade');
     const encPack = { ...enc, plain, ts: Math.floor(Date.now() / 1000) };
     const res = await postSignalOnchainAuto(encPack);
     if (!res.ok) {
-      console.error('On-chain post failed:', res.reason);
+      console.error('On-chain post failed:', res.reason || 'unknown');
     } else {
       console.log(`Signal posted on-chain: ${res.hash}`);
     }
@@ -732,31 +806,17 @@ async function handleNewSignalPack({ latest, raw }) {
 
 async function pollLoop() {
   console.log(`[Bot] running on ${net.toUpperCase()}`);
-  console.log('Admin:', admin.accountAddress.toString());
+  console.log('Admin:', ADMIN_ADDR);
 
-  let backoff = POLL_MS;
+  let backoff = Math.max(10_000, Number(SIGNAL_POLL_MS) || 60_000);
   while (true) {
     try {
       const pack = await fetchLatestSignal();
       await handleNewSignalPack(pack);
-      backoff = POLL_MS; // Reset backoff on success
+      backoff = Math.max(10_000, Number(SIGNAL_POLL_MS) || 60_000); // Reset backoff on success
     } catch (e) {
       console.error('Poll error:', e.message);
-      // Notify users with monitoring enabled about failure
-      for (const [tid, _u] of Object.entries(users)) {
-        const u = ensureUser(tid);
-        if (!u.monitor) continue;
-        try {
-          await bot.telegram.sendMessage(
-            tid,
-            '📡 Bot is monitoring signals...\n<b>Signal feed unavailable</b>',
-            { parse_mode: 'HTML', ...MAIN_KB }
-          );
-        } catch (e) {
-          console.error(`Failed to notify user ${tid} for monitoring error:`, e.message);
-        }
-      }
-      backoff = Math.min(backoff * 2, 300_000); // Max 5 min
+      backoff = Math.min(backoff * 2, 300_000);
     }
     await wait(backoff);
   }
@@ -774,3 +834,4 @@ bot.launch().then(() => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
