@@ -221,13 +221,6 @@ aptos move run \
     ```
 
 
----
-
-## 11) Files to know
-
-* `bot.mjs` — the Telegram bot (paper engine, signal polling, on-chain posting)
-* `users.json` — per-Telegram user wallets & state (address, private key string, paper balance, positions, etc.)
-* `state.json` — last processed feed key (prevents duplicate actions)
 
 ---
 
