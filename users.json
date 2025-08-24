@@ -1,13 +1,1 @@
-{
-  "828537097": {
-    "addr": "0xc15ccf35138f0f6ca4c498d3c17f80e3497bd9b150b0c126f02b326eb05b7255",
-    "pk": "0x58ea08062c936b163534d022c85bc22d1dbaa5a8cdc5685e5876ee5f720e0d1d",
-    "isAdmin": true,
-    "auto": true,
-    "monitor": true,
-    "risk": 2,
-    "paperUSDC": 10000,
-    "positions": [],
-    "alloc": 0.25
-  }
-}
+
