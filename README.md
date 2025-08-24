@@ -1,14 +1,6 @@
 # AptosTrader Bot — README (Testnet)
 [![▶ Watch the Youtube demo](https://img.shields.io/badge/%E2%96%B6%20Watch%20the%20demo-red?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=zP02MlN8OhY)
 
-<a href="https://www.youtube.com/watch?v=zP02MlN8OhY" target="_blank" rel="noopener">
-  <img
-    src="https://img.shields.io/badge/%E2%96%B6%20Watch%20the%20demo-red?style=for-the-badge&logo=youtube&logoColor=white"
-    alt="Watch the demo"
-    height="60"
-  >
-</a>
-
 
 > [!NOTE]
 > **Product Presentation:** https://drive.google.com/file/d/1-4YLmoxYJ7T7iQNdQ8eOXRIH8iEGl-eH/view?usp=drive_link  
