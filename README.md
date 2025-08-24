@@ -10,9 +10,9 @@
 A Telegram bot that:
 
 * Creates a trading wallet per Telegram user .
-* Listens to an external signal feed and **auto-opens/ closes paper positions** based on your size and leverage.
-* **Posts each new signal on-chain** to your Move contracts (admin only by default; optional per-user posting).
-* Provides quick portfolio readouts and simple risk/size controls via Telegram keyboard.
+* Listens to an external AI based signals and **auto-opens/ closes trading positions** based on your wallet balance and risk capacity.
+* **Posts each new signal on-chain** to the Move contracts (admin only by default; optional per-user posting).
+* Provides quick portfolio updates (Realized and Unrealized PnL) and simple risk/size controls via Telegram keyboard.
 
 ---
 
@@ -110,7 +110,7 @@ Open your Telegram bot and send `/start`.
 
 * **/start**
 
-  * If you’re new: the bot generates a user wallet, stores it in `users.json`, and **requests faucet** funds on testnet once.
+  * If you’re new: the bot generates a user wallet, and **requests faucet** funds on testnet once.
   * Shows your wallet address and the keyboard menu (UI stays exactly as in the code).
 * **Signal polling**
 
