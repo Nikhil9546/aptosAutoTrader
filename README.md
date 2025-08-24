@@ -228,14 +228,6 @@ aptos move run \
     ```
 
 
-
----
-
-## 12) Security
-
-* This is a **testnet**/demo bot. It stores user private keys locally in `users.json`.
-  Do **not** use mainnet funds with this setup.
-
 ---
 
 That’s it. Launch the bot, tap `/start`, set `/size` and `/riskfactor`, and watch your **paper portfolio** and **on-chain `UserSignals`** update as new signals arrive.
