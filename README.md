@@ -2,7 +2,7 @@
 
 A Telegram bot that:
 
-* Creates a paper-trading wallet per Telegram user (no UI changes needed).
+* Creates a trading wallet per Telegram user .
 * Listens to an external signal feed and **auto-opens/ closes paper positions** based on your size and leverage.
 * **Posts each new signal on-chain** to your Move contracts (admin only by default; optional per-user posting).
 * Provides quick portfolio readouts and simple risk/size controls via Telegram keyboard.
