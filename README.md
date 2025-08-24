@@ -1,4 +1,7 @@
 # AptosTrader Bot — README (Testnet)
+Youtube Video : https://www.youtube.com/watch?v=zP02MlN8OhY
+Product screenshot: https://drive.google.com/file/d/1wbLuWRhCY7gqf20Lo4gYOGbBWCmM3Trz/view?usp=drive_link
+Product links: https://drive.google.com/drive/folders/1aXkEsXl-POTXhRCarXHde1RMo2uj61VO?usp=sharing
 
 A Telegram bot that:
 
