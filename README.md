@@ -1,4 +1,4 @@
-# AptosTrader Bot — README (Testnet)
+# AptosTrader Bot
 [![▶ Watch the Youtube demo](https://img.shields.io/badge/%E2%96%B6%20Watch%20the%20demo-red?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=zP02MlN8OhY)
 
 
