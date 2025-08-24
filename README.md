@@ -1,8 +1,11 @@
 # AptosTrader Bot — README (Testnet)
-[![Watch the demo](https://img.youtube.com/vi/zP02MlN8OhY/hqdefault.jpg)](https://www.youtube.com/watch?v=zP02MlN8OhY)
+[![▶ Watch the Youtube demo](https://img.shields.io/badge/%E2%96%B6%20Watch%20the%20demo-red?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=zP02MlN8OhY)
 
-Product screenshot: https://drive.google.com/file/d/1wbLuWRhCY7gqf20Lo4gYOGbBWCmM3Trz/view?usp=drive_link  
-Product links: https://drive.google.com/drive/folders/1aXkEsXl-POTXhRCarXHde1RMo2uj61VO?usp=sharing
+
+> [!NOTE]
+> **Product Presentation:** https://drive.google.com/file/d/1-4YLmoxYJ7T7iQNdQ8eOXRIH8iEGl-eH/view?usp=drive_link  
+> **Product Screenshots:** https://drive.google.com/drive/folders/1BximX_XQyQJ7j13pAVUfb64Gef9q3IhK?usp=drive_link  
+> **Product Resources:** https://drive.google.com/drive/folders/1aXkEsXl-POTXhRCarXHde1RMo2uj61VO?usp=sharing
 
 A Telegram bot that:
 
